@@ -1,0 +1,174 @@
+{
+  "_notes": "Paste each object in the 'functions' array into Vapi's Assistant > Functions config (or via the Vapi API when creating the assistant). 'server.url' should point to your webhook (mocked endpoints are fine for the demo — e.g. a simple Express/FastAPI app or a request-bin style mock that returns canned JSON). Every tool has a 2s client-side timeout and 1 retry per the HLD (§5).",
+  "functions": [
+    {
+      "name": "verify_customer",
+      "description": "Verify the caller's identity against the account on file before any account or debt information may be disclosed. Must be called before get_account_details.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "phone_number": { "type": "string", "description": "The phone number the call is connected to, in E.164 format." },
+          "spoken_dob": { "type": "string", "description": "Date of birth as stated by the caller, normalized to YYYY-MM-DD." },
+          "spoken_last4": { "type": "string", "description": "Last 4 digits of the loan account or PAN reference as stated by the caller. Optional if pincode is provided instead." },
+          "spoken_pincode": { "type": "string", "description": "Registered pincode as stated by the caller. Optional if last4 is provided instead." }
+        },
+        "required": ["phone_number", "spoken_dob"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/verify_customer" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "match": { "type": "boolean" },
+          "match_factors": { "type": "integer", "description": "Number of factors that matched (0-2)." },
+          "customer_id": { "type": "string", "description": "Present only if match is true." }
+        }
+      }
+    },
+    {
+      "name": "get_account_details",
+      "description": "Fetch the customer's current loan/EMI details. Only callable after verify_customer has returned match:true for this call (server enforces this — do not call before authentication succeeds).",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": { "type": "string", "description": "customer_id returned by verify_customer." }
+        },
+        "required": ["customer_id"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/get_account_details" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "loan_id": { "type": "string" },
+          "product_type": { "type": "string" },
+          "emi_amount": { "type": "number" },
+          "dpd": { "type": "integer" },
+          "last_payment_date": { "type": "string" },
+          "outstanding_balance": { "type": "number" },
+          "payment_status": { "type": "string", "enum": ["overdue", "paid", "partial"] }
+        }
+      }
+    },
+    {
+      "name": "log_promise_to_pay",
+      "description": "Log a customer's commitment to pay by a specific date/amount. Idempotent per (loan_id, call_id) to avoid duplicate PTPs on retried turns.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": { "type": "string" },
+          "loan_id": { "type": "string" },
+          "ptp_date": { "type": "string", "description": "ISO date YYYY-MM-DD." },
+          "ptp_amount": { "type": "number" },
+          "channel": { "type": "string", "enum": ["voicebot"], "default": "voicebot" }
+        },
+        "required": ["customer_id", "loan_id", "ptp_date", "ptp_amount"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/log_promise_to_pay" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "ptp_id": { "type": "string" },
+          "status": { "type": "string", "enum": ["logged", "duplicate", "failed"] }
+        }
+      }
+    },
+    {
+      "name": "send_payment_link",
+      "description": "Send a payment link to the customer via SMS or WhatsApp. Should generally be called after log_promise_to_pay succeeds, or during an already-paid verification flow if a residual amount remains.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": { "type": "string" },
+          "loan_id": { "type": "string" },
+          "amount": { "type": "number" },
+          "channel": { "type": "string", "enum": ["sms", "whatsapp"] }
+        },
+        "required": ["customer_id", "loan_id", "amount", "channel"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/send_payment_link" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "link_id": { "type": "string" },
+          "delivery_status": { "type": "string", "enum": ["sent", "failed"] }
+        }
+      }
+    },
+    {
+      "name": "escalate_to_agent",
+      "description": "Hand off the case to a human collections agent. Used for hardship, disputes, ambiguous authentication, abusive callers, technical failures, or explicit customer request to speak to a person.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "customer_id": { "type": "string" },
+          "call_id": { "type": "string" },
+          "reason": {
+            "type": "string",
+            "enum": ["hardship", "dispute", "ambiguous_auth", "abusive", "tech_failure", "customer_request"]
+          },
+          "transcript_summary": { "type": "string", "description": "Brief paraphrased summary for the human agent, not a verbatim transcript dump." }
+        },
+        "required": ["call_id", "reason"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/escalate_to_agent" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "ticket_id": { "type": "string" },
+          "queue": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "mark_disposition",
+      "description": "Log the final outcome of the call. MUST be called exactly once before every call ends, regardless of outcome.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "call_id": { "type": "string" },
+          "disposition": {
+            "type": "string",
+            "enum": [
+              "ptp_made",
+              "escalated",
+              "already_paid",
+              "wrong_person",
+              "do_not_call",
+              "no_answer_voicemail",
+              "callback_scheduled",
+              "incomplete_tech_failure"
+            ]
+          },
+          "notes": { "type": "string" }
+        },
+        "required": ["call_id", "disposition"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/mark_disposition" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "ack": { "type": "boolean" }
+        }
+      }
+    },
+    {
+      "name": "check_call_window",
+      "description": "Pre-dial guard (called by the dialer/pipeline before connecting, not mid-conversation) to confirm the call is within permitted hours and the number isn't on the do-not-call list.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "phone_number": { "type": "string" },
+          "timezone": { "type": "string", "default": "Asia/Kolkata" }
+        },
+        "required": ["phone_number"]
+      },
+      "server": { "url": "https://mock.kapture-demo.example/tools/check_call_window" },
+      "response_schema": {
+        "type": "object",
+        "properties": {
+          "allowed": { "type": "boolean" },
+          "reason": { "type": "string" }
+        }
+      }
+    }
+  ]
+}
